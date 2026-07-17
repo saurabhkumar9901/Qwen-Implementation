@@ -1,0 +1,19 @@
+{
+  "vocab_size": 151669,
+  "num_hidden_layers": 4,
+  "num_attention_heads": 8,
+  "num_key_value_heads": 4,
+  "max_position_embeddings": 256,
+  "tie_word_embeddings": true,
+  "rope_theta": 1000000.0,
+  "hidden_size": 512,
+  "intermediate_size": 1024,
+  "rms_norm_eps": 1e-06,
+  "gradient_checkpointing": true,
+  "batch_size": 1,
+  "accumulation_steps": 4,
+  "epochs": 100,
+  "lr": 0.0001,
+  "num_samples": 100,
+  "weight_decay": 0.1
+}
