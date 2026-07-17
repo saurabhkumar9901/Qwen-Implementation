@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+import math
 from config import Qwen3_0_6B_Config
 from layers import Qwen3RMSNorm, Qwen3MLP, Qwen3RotaryEmbedding
 from attention import Qwen3Attention
@@ -13,21 +14,24 @@ class Qwen3Block(nn.Module):
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = Qwen3MLP(config)
 
-    def forward(self, hidden_states, attention_mask, position_ids, rot_emb):
+    def forward(self, hidden_states, attention_mask, position_ids, past_key_value=None, cos=None, sin=None, use_cache=False):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
+        hidden_states, past_key_value = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            rot_emb=rot_emb
+            past_key_value=past_key_value,
+            cos=cos,
+            sin=sin,
+            use_cache=use_cache
         )
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, past_key_value
 
 class Qwen3Model(nn.Module):
     def __init__(self, config):
@@ -46,43 +50,82 @@ class Qwen3Model(nn.Module):
     def enable_gradient_checkpointing(self, enable=True):
         self.gradient_checkpointing = enable
 
-    def forward(self, input_ids, attention_mask=None, position_ids=None):
+    def forward(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, use_cache=False):
         batch_size, seq_len = input_ids.shape
         
+        if past_key_values is None:
+            past_key_values_length = 0
+        else:
+            past_key_values_length = past_key_values[0][0].shape[2]
+            
         if position_ids is None:
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+            position_ids = torch.arange(
+                past_key_values_length, seq_len + past_key_values_length, dtype=torch.long, device=input_ids.device
+            )
             position_ids = position_ids.unsqueeze(0).expand(batch_size, seq_len)
         
         hidden_states = self.embed_tokens(input_ids)
         
+        cos, sin = self.rotary_emb(position_ids)
+        
         # Create attention mask
         if attention_mask is None:
-            causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device))
-            attention_mask = (~causal_mask).unsqueeze(0).unsqueeze(0).float() * -1e9
+            if seq_len > 1:
+                causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device))
+                if past_key_values_length > 0:
+                    past_mask = torch.ones((seq_len, past_key_values_length), dtype=torch.bool, device=input_ids.device)
+                    causal_mask = torch.cat([past_mask, causal_mask], dim=-1)
+                attention_mask = (~causal_mask).unsqueeze(0).unsqueeze(0).float() * -1e9
         else:
             # Text-only: combine causal mask with padding mask
-            causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device))
-            # Padding mask on key side: (B, 1, seq_len)
-            padding_mask = attention_mask.unsqueeze(1).bool()
-            # Combined: attend only to non-padded keys that are at or before the query position
-            combined = causal_mask.unsqueeze(0) & padding_mask  # (B, seq_len, seq_len)
-            attention_mask = (~combined).unsqueeze(1).float() * -1e9  # (B, 1, S, S)
+            if seq_len > 1:
+                causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device))
+                if past_key_values_length > 0:
+                    past_mask = torch.ones((seq_len, past_key_values_length), dtype=torch.bool, device=input_ids.device)
+                    causal_mask = torch.cat([past_mask, causal_mask], dim=-1)
+                
+                # Padding mask on key side: (B, 1, seq_len + past_key_values_length)
+                padding_mask = attention_mask.unsqueeze(1).bool()
+                # Combined: attend only to non-padded keys that are at or before the query position
+                combined = causal_mask.unsqueeze(0) & padding_mask  # (B, seq_len, seq_len + past)
+                attention_mask = (~combined).unsqueeze(1).float() * -1e9  # (B, 1, S, S+past)
+            else:
+                padding_mask = attention_mask.unsqueeze(1).unsqueeze(2).bool()
+                attention_mask = (~padding_mask).float() * -1e9
         
-        for layer in self.layers:
+        next_decoder_cache = () if use_cache else None
+        
+        for idx, layer in enumerate(self.layers):
+            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            
             if self.gradient_checkpointing and self.training:
-                hidden_states = checkpoint(
+                hidden_states, _ = checkpoint(
                     layer,
                     hidden_states,
                     attention_mask,
                     position_ids,
-                    self.rotary_emb,
+                    None,
+                    cos,
+                    sin,
+                    False,
                     use_reentrant=False
                 )
             else:
-                hidden_states = layer(hidden_states, attention_mask, position_ids, self.rotary_emb)
+                hidden_states, past_key_value = layer(
+                    hidden_states, 
+                    attention_mask, 
+                    position_ids, 
+                    past_key_value=past_key_value, 
+                    cos=cos, 
+                    sin=sin, 
+                    use_cache=use_cache
+                )
+                
+            if use_cache:
+                next_decoder_cache += (past_key_value,)
         
         hidden_states = self.norm(hidden_states)
-        return hidden_states
+        return hidden_states, next_decoder_cache
 
 class Qwen3ForCausalLM(nn.Module):
     def __init__(self, config):
@@ -93,18 +136,55 @@ class Qwen3ForCausalLM(nn.Module):
 
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+            
+        self.apply(self._init_weights)
 
-    def forward(self, input_ids, attention_mask=None, position_ids=None):
-        hidden_states = self.model(input_ids, attention_mask, position_ids)
+    def _init_weights(self, module):
+        std = 0.02
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+        for pn, p in self.named_parameters():
+            if pn.endswith('o_proj.weight') or pn.endswith('down_proj.weight'):
+                p.data.normal_(mean=0.0, std=(std / math.sqrt(2 * self.config.num_hidden_layers)))
+
+    def forward(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, use_cache=False):
+        hidden_states, next_cache = self.model(
+            input_ids, 
+            attention_mask=attention_mask, 
+            position_ids=position_ids, 
+            past_key_values=past_key_values,
+            use_cache=use_cache
+        )
         logits = self.lm_head(hidden_states)
+        if use_cache:
+            return logits, next_cache
         return logits
     
     def generate(self, input_ids, max_new_tokens=100, temperature=0.7, top_k=20):
-        """Simple generation method"""
+        """KV-cached generation method"""
         device = input_ids.device
+        past_key_values = None
         
         for _ in range(max_new_tokens):
-            logits = self(input_ids)
+            if past_key_values is not None:
+                model_inputs = input_ids[:, -1:]
+            else:
+                model_inputs = input_ids
+                
+            outputs = self(
+                model_inputs, 
+                past_key_values=past_key_values, 
+                use_cache=True
+            )
+            logits, past_key_values = outputs
+            
             next_token_logits = logits[:, -1, :]
             
             if temperature > 0.0:

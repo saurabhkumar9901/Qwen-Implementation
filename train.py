@@ -73,11 +73,15 @@ def train_step(model, batch, optimizer, scheduler, scaler, device, accumulation_
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
         if scaler is not None and scaler.is_enabled():
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            scale_after = scaler.get_scale()
+            if scale_before <= scale_after:
+                scheduler.step()
         else:
             optimizer.step()
-        scheduler.step()
+            scheduler.step()
         optimizer.zero_grad()
     
     return loss.item() * accumulation_steps
@@ -129,10 +133,7 @@ def train_code(args):
         print("Using CPU-optimized config (~30M parameters)")
     else:
         config = Qwen3_0_6B_Config(gradient_checkpointing=args.gradient_checkpointing)
-        if device.type == "cpu":
-            config.max_position_embeddings = 512
-        else:
-            config.max_position_embeddings = args.max_length
+        config.max_position_embeddings = args.max_length
     
     model = Qwen3ForCausalLM(config).to(device)
     
@@ -187,15 +188,22 @@ def train_code(args):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
         
         # Deterministic shuffle per epoch for safe resuming
-        generator = torch.Generator()
-        generator.manual_seed(42 + epoch)
-        sampler = torch.utils.data.RandomSampler(dataset, generator=generator)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=config.batch_size,
-            sampler=sampler,
-            num_workers=args.num_workers if device.type == "cuda" else 0
-        )
+        if getattr(dataset, "streaming", False) or isinstance(dataset, torch.utils.data.IterableDataset):
+            dataloader = DataLoader(
+                dataset,
+                batch_size=config.batch_size,
+                num_workers=args.num_workers if device.type == "cuda" else 0
+            )
+        else:
+            generator = torch.Generator()
+            generator.manual_seed(42 + epoch)
+            sampler = torch.utils.data.RandomSampler(dataset, generator=generator)
+            dataloader = DataLoader(
+                dataset,
+                batch_size=config.batch_size,
+                sampler=sampler,
+                num_workers=args.num_workers if device.type == "cuda" else 0
+            )
         
         for step_idx, batch in enumerate(dataloader):
             if epoch == start_epoch and step_idx < start_step:
@@ -236,11 +244,15 @@ def train_code(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             if scaler is not None and scaler.is_enabled():
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                scale_after = scaler.get_scale()
+                if scale_before <= scale_after:
+                    scheduler.step()
             else:
                 optimizer.step()
-            scheduler.step()
+                scheduler.step()
             optimizer.zero_grad()
 
 
@@ -259,8 +271,7 @@ def train_code_instruction(args):
         print("Using CPU-optimized config (~30M parameters)")
     else:
         config = Qwen3_0_6B_Config(gradient_checkpointing=args.gradient_checkpointing)
-        if device.type == "cpu":
-            config.max_position_embeddings = 512
+        config.max_position_embeddings = args.max_length
     
     model = Qwen3ForCausalLM(config).to(device)
     
@@ -303,15 +314,22 @@ def train_code_instruction(args):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
         
         # Deterministic shuffle per epoch for safe resuming
-        generator = torch.Generator()
-        generator.manual_seed(42 + epoch)
-        sampler = torch.utils.data.RandomSampler(dataset, generator=generator)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=config.batch_size,
-            sampler=sampler,
-            num_workers=args.num_workers if device.type == "cuda" else 0
-        )
+        if getattr(dataset, "streaming", False) or isinstance(dataset, torch.utils.data.IterableDataset):
+            dataloader = DataLoader(
+                dataset,
+                batch_size=config.batch_size,
+                num_workers=args.num_workers if device.type == "cuda" else 0
+            )
+        else:
+            generator = torch.Generator()
+            generator.manual_seed(42 + epoch)
+            sampler = torch.utils.data.RandomSampler(dataset, generator=generator)
+            dataloader = DataLoader(
+                dataset,
+                batch_size=config.batch_size,
+                sampler=sampler,
+                num_workers=args.num_workers if device.type == "cuda" else 0
+            )
         
         for step_idx, batch in enumerate(dataloader):
             if epoch == start_epoch and step_idx < start_step:
@@ -352,11 +370,15 @@ def train_code_instruction(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             if scaler is not None and scaler.is_enabled():
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                scale_after = scaler.get_scale()
+                if scale_before <= scale_after:
+                    scheduler.step()
             else:
                 optimizer.step()
-            scheduler.step()
+                scheduler.step()
             optimizer.zero_grad()
 
 

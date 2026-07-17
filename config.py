@@ -3,7 +3,7 @@ from dataclasses import dataclass
 @dataclass
 class Qwen3_0_6B_Config:
     # Core Qwen3 Specifications
-    vocab_size: int = 151669                 
+    vocab_size: int = 151680                 
     num_hidden_layers: int = 28              
     num_attention_heads: int = 16            
     num_key_value_heads: int = 8             

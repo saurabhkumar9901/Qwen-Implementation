@@ -26,26 +26,14 @@ def generate(
     print(f"Prompt: {prompt}")
     print("Generating...", end="", flush=True)
 
-    for _ in range(max_new_tokens):
-        logits = model(input_ids)
-        next_token_logits = logits[:, -1, :]
-        
-        if temperature > 0.0:
-            next_token_logits = next_token_logits / temperature
-            
-        if top_k > 0:
-            indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-            next_token_logits[indices_to_remove] = -float('Inf')
-            
-        probs = F.softmax(next_token_logits, dim=-1)
-        next_token_id = torch.multinomial(probs, num_samples=1)
-        
-        input_ids = torch.cat([input_ids, next_token_id], dim=-1)
-        
-        if next_token_id.item() == tokenizer.eos_token_id:
-            break
+    output_ids = model.generate(
+        input_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k
+    )
 
-    generated_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+    generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     return generated_text
 
 def main():

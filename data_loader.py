@@ -16,7 +16,7 @@ except ImportError:
     print("[WARNING] 'datasets' library not available. Using synthetic data.")
 
 
-class BaseDataset(Dataset):
+class BaseDataset:
     def __init__(self, tokenizer_name: str = "Qwen/Qwen2.5-0.5B", max_length: int = 2048):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         self.max_length = max_length
@@ -31,7 +31,7 @@ class BaseDataset(Dataset):
         return labels
 
 
-class CodeDataset(BaseDataset):
+class CodeDataset(BaseDataset, IterableDataset):
     def __init__(
         self,
         dataset_name: str = "bigcode/starcoderdata",
@@ -44,39 +44,34 @@ class CodeDataset(BaseDataset):
     ):
         super().__init__(tokenizer_name, max_length)
         
+        self.dataset_name = dataset_name
+        self.split = split
         self.language = language
         self.streaming = streaming
         self.num_samples = num_samples or 100
         self._cached_data = []
         
-        raw_texts = []
-        # Try to load real data first, fall back to synthetic
-        if HAS_HF_DATASETS:
-            try:
-                raw_texts = self._load_real_data(dataset_name, language, split)
-            except Exception as e:
-                print(f"[WARNING] Failed to load {dataset_name}: {e}")
-                print("[WARNING] Falling back to synthetic data.")
+        if not self.streaming:
+            # Try to load real data first, fall back to synthetic
+            if HAS_HF_DATASETS:
+                try:
+                    raw_texts = self._load_real_data(dataset_name, language, split)
+                except Exception as e:
+                    print(f"[WARNING] Failed to load {dataset_name}: {e}")
+                    print("[WARNING] Falling back to synthetic data.")
+                    raw_texts = self._generate_synthetic_code()
+            else:
                 raw_texts = self._generate_synthetic_code()
-        else:
-            raw_texts = self._generate_synthetic_code()
-            
-        self._process_chunks(raw_texts)
+                
+            self._process_chunks(raw_texts)
     
     def _load_real_data(self, dataset_name, language, split):
         """Load real code data from HuggingFace."""
         print(f"[INFO] Loading {dataset_name} (language={language})...")
         texts = []
-        if self.streaming:
-            ds = load_dataset(dataset_name, data_dir=language, split=split, streaming=True)
-            for i, sample in enumerate(ds):
-                if i >= self.num_samples:
-                    break
-                texts.append(sample.get('content', ''))
-        else:
-            ds = load_dataset(dataset_name, data_dir=language, split=split)
-            for i in range(min(self.num_samples, len(ds))):
-                texts.append(ds[i].get('content', ''))
+        ds = load_dataset(dataset_name, data_dir=language, split=split)
+        for i in range(min(self.num_samples, len(ds))):
+            texts.append(ds[i].get('content', ''))
         
         if not texts:
             raise ValueError("No data loaded from dataset")
@@ -102,44 +97,90 @@ class CodeDataset(BaseDataset):
         print(f"[INFO] Generated {self.num_samples} synthetic code samples")
         return texts
 
+    def _process_single_text(self, text):
+        """Process a single text string into multiple chunks, ensuring EOS token on every chunk."""
+        chunks = []
+        encoding = self.tokenizer(text, return_tensors='pt', add_special_tokens=False)
+        input_ids_full = encoding['input_ids'].squeeze(0)
+        
+        eos_id = self.tokenizer.eos_token_id
+        
+        seq_len = input_ids_full.size(0)
+        for i in range(0, seq_len, self.max_length - 1): # leave room for eos
+            chunk = input_ids_full[i : i + self.max_length - 1]
+            
+            # Ensure every chunk gets an EOS token
+            if chunk[-1].item() != eos_id:
+                chunk = torch.cat([chunk, torch.tensor([eos_id], dtype=torch.long)])
+                
+            pad_len = self.max_length - chunk.size(0)
+            
+            if pad_len > 0:
+                pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else eos_id
+                padded_chunk = torch.cat([chunk, torch.full((pad_len,), pad_id, dtype=torch.long)])
+                attention_mask = torch.cat([torch.ones_like(chunk), torch.zeros(pad_len, dtype=torch.long)])
+            else:
+                padded_chunk = chunk
+                attention_mask = torch.ones_like(chunk)
+            
+            labels = self._mask_padding_in_labels(padded_chunk, attention_mask)
+            chunks.append({
+                'input_ids': padded_chunk,
+                'attention_mask': attention_mask,
+                'labels': labels
+            })
+        return chunks
+
     def _process_chunks(self, texts):
         self._cached_data = []
         for text in texts:
-            if not text.endswith(self.tokenizer.eos_token):
-                text = text + self.tokenizer.eos_token
-                
-            encoding = self.tokenizer(text, return_tensors='pt', add_special_tokens=False)
-            input_ids_full = encoding['input_ids'].squeeze(0)
-            
-            seq_len = input_ids_full.size(0)
-            for i in range(0, seq_len, self.max_length):
-                chunk = input_ids_full[i : i + self.max_length]
-                pad_len = self.max_length - chunk.size(0)
-                
-                if pad_len > 0:
-                    pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
-                    padded_chunk = torch.cat([chunk, torch.full((pad_len,), pad_id, dtype=torch.long)])
-                    attention_mask = torch.cat([torch.ones_like(chunk), torch.zeros(pad_len, dtype=torch.long)])
-                else:
-                    padded_chunk = chunk
-                    attention_mask = torch.ones_like(chunk)
-                
-                labels = self._mask_padding_in_labels(padded_chunk, attention_mask)
-                self._cached_data.append({
-                    'input_ids': padded_chunk,
-                    'attention_mask': attention_mask,
-                    'labels': labels
-                })
+            self._cached_data.extend(self._process_single_text(text))
         print(f"[INFO] Processed texts into {len(self._cached_data)} chunks of length {self.max_length}")
     
     def __len__(self):
+        # Only valid for map-style
+        if self.streaming:
+            return self.num_samples
         return len(self._cached_data)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        if self.streaming:
+            raise TypeError("Cannot use __getitem__ on a streaming dataset.")
         return self._cached_data[idx % len(self._cached_data)]
+        
+    def __iter__(self):
+        if not self.streaming:
+            for item in self._cached_data:
+                yield item
+            return
+            
+        count = 0
+        if HAS_HF_DATASETS:
+            try:
+                ds = load_dataset(self.dataset_name, data_dir=self.language, split=self.split, streaming=True)
+                for sample in ds:
+                    if count >= self.num_samples:
+                        break
+                    text = sample.get('content', '')
+                    chunks = self._process_single_text(text)
+                    for chunk in chunks:
+                        yield chunk
+                    count += 1
+                return
+            except Exception as e:
+                print(f"[WARNING] Streaming failed: {e}. Falling back to synthetic.")
+                
+        # Synthetic fallback
+        while count < self.num_samples:
+            texts = self._generate_synthetic_code()
+            for text in texts:
+                chunks = self._process_single_text(text)
+                for chunk in chunks:
+                    yield chunk
+            count += len(texts)
 
 
-class CodeInstructionDataset(BaseDataset):
+class CodeInstructionDataset(BaseDataset, Dataset):
     def __init__(
         self,
         dataset_name: str = "sahil2801/code_alpaca",

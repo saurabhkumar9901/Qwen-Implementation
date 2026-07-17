@@ -9,8 +9,8 @@ class Qwen3RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, hidden_states):
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps).to(hidden_states.dtype)
         return self.weight * hidden_states
 
 class Qwen3RotaryEmbedding(nn.Module):
@@ -21,14 +21,18 @@ class Qwen3RotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
+        # Build cache once
+        t = torch.arange(max_position_embeddings).float()
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cache", emb.cos(), persistent=False)
+        self.register_buffer("sin_cache", emb.sin(), persistent=False)
 
     def forward(self, position_ids):
         # position_ids: (batch, seq_len)
-        t = position_ids.float()
-        freqs = torch.einsum("bi,j->bij", t, self.inv_freq.to(t.device))
-        emb = torch.cat((freqs, freqs), dim=-1)  # (B, S, head_dim)
-        cos = emb.cos()  # (B, S, head_dim)
-        sin = emb.sin()  # (B, S, head_dim)
+        cos = self.cos_cache[position_ids]
+        sin = self.sin_cache[position_ids]
         return cos, sin
 
 def rotate_half(x):

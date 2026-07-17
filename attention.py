@@ -21,7 +21,7 @@ class Qwen3Attention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.num_heads * self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3RMSNorm(self.num_kv_heads * self.head_dim, eps=config.rms_norm_eps)
 
-    def forward(self, hidden_states, attention_mask, position_ids, past_key_value=None, rot_emb=None):
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, cos=None, sin=None, use_cache=False):
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -35,21 +35,48 @@ class Qwen3Attention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        cos, sin = rot_emb(position_ids)
+        # Apply RoPE
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        key_states = key_states.repeat(1, self.num_key_value_groups, 1, 1)
-        value_states = value_states.repeat(1, self.num_key_value_groups, 1, 1)
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            
+        past_key_value = (key_states, value_states) if use_cache else None
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-        
+        # Repeat kv heads for GQA so that SDPA can broadcast correctly if needed, or rely on SDPA's built in GQA.
+        # PyTorch SDPA does not natively support different number of Q and KV heads via broadcasting 
+        # unless we explicitly expand them, BUT wait, since PyTorch 2.2 SDPA supports GQA natively by passing them as is?
+        # Actually, in PyTorch 2.1+, SDPA natively supports GQA if you pass enable_gqa=True, but the standard way 
+        # to use SDPA with GQA without native support is using repeat_interleave which is more efficient than repeat.
+        # Let's use repeat_interleave so it works universally with SDPA.
+        key_states = torch.repeat_interleave(key_states, dim=1, repeats=self.num_key_value_groups)
+        value_states = torch.repeat_interleave(value_states, dim=1, repeats=self.num_key_value_groups)
+
+        # FlashAttention / SDPA
+        # SDPA handles causal mask natively if is_causal=True. But we might have a custom attention_mask for padding.
         if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+            # We assume attention_mask is a boolean mask or additive mask.
+            # SDPA expects an additive mask of shape (B, 1, Q, K)
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+            )
+        else:
+            # If generating (q_len == 1) and no mask, causal mask is false
+            is_causal = True if q_len > 1 else False
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                is_causal=is_causal,
+                dropout_p=0.0,
+            )
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
-        
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
-        return attn_output
+        return attn_output, past_key_value
