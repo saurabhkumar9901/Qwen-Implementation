@@ -69,14 +69,7 @@ class Qwen3Model(nn.Module):
         cos, sin = self.rotary_emb(position_ids)
         
         # Create attention mask
-        if attention_mask is None:
-            if seq_len > 1:
-                causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device))
-                if past_key_values_length > 0:
-                    past_mask = torch.ones((seq_len, past_key_values_length), dtype=torch.bool, device=input_ids.device)
-                    causal_mask = torch.cat([past_mask, causal_mask], dim=-1)
-                attention_mask = (~causal_mask).unsqueeze(0).unsqueeze(0).float() * -1e9
-        else:
+        if attention_mask is not None:
             # Text-only: combine causal mask with padding mask
             if seq_len > 1:
                 causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=input_ids.device))
@@ -88,10 +81,12 @@ class Qwen3Model(nn.Module):
                 padding_mask = attention_mask.unsqueeze(1).bool()
                 # Combined: attend only to non-padded keys that are at or before the query position
                 combined = causal_mask.unsqueeze(0) & padding_mask  # (B, seq_len, seq_len + past)
-                attention_mask = (~combined).unsqueeze(1).float() * -1e9  # (B, 1, S, S+past)
+                min_val = torch.finfo(hidden_states.dtype).min
+                attention_mask = (~combined).unsqueeze(1).to(hidden_states.dtype) * min_val  # (B, 1, S, S+past)
             else:
                 padding_mask = attention_mask.unsqueeze(1).unsqueeze(2).bool()
-                attention_mask = (~padding_mask).float() * -1e9
+                min_val = torch.finfo(hidden_states.dtype).min
+                attention_mask = (~padding_mask).to(hidden_states.dtype) * min_val
         
         next_decoder_cache = () if use_cache else None
         
@@ -134,10 +129,17 @@ class Qwen3ForCausalLM(nn.Module):
         self.model = Qwen3Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        self.apply(self._init_weights)
+        
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
             
-        self.apply(self._init_weights)
+
+        # Apply special scaling for residual projections ONCE after all modules are initialized
+        std = 0.02
+        for pn, p in self.named_parameters():
+            if pn.endswith('o_proj.weight') or pn.endswith('down_proj.weight'):
+                p.data.normal_(mean=0.0, std=(std / math.sqrt(2 * self.config.num_hidden_layers)))
 
     def _init_weights(self, module):
         std = 0.02
@@ -149,10 +151,6 @@ class Qwen3ForCausalLM(nn.Module):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-
-        for pn, p in self.named_parameters():
-            if pn.endswith('o_proj.weight') or pn.endswith('down_proj.weight'):
-                p.data.normal_(mean=0.0, std=(std / math.sqrt(2 * self.config.num_hidden_layers)))
 
     def forward(self, input_ids, attention_mask=None, position_ids=None, past_key_values=None, use_cache=False):
         hidden_states, next_cache = self.model(
@@ -167,19 +165,30 @@ class Qwen3ForCausalLM(nn.Module):
             return logits, next_cache
         return logits
     
-    def generate(self, input_ids, max_new_tokens=100, temperature=0.7, top_k=20):
+    def generate(self, input_ids, attention_mask=None, max_new_tokens=100, temperature=0.7, top_k=20):
         """KV-cached generation method"""
         device = input_ids.device
         past_key_values = None
         
+        # Generate position ids if not provided
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+            
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 1)
+        
         for _ in range(max_new_tokens):
             if past_key_values is not None:
                 model_inputs = input_ids[:, -1:]
+                pos_ids = position_ids[:, -1:]
             else:
                 model_inputs = input_ids
+                pos_ids = position_ids
                 
             outputs = self(
                 model_inputs, 
+                attention_mask=attention_mask,
+                position_ids=pos_ids,
                 past_key_values=past_key_values, 
                 use_cache=True
             )
@@ -189,15 +198,23 @@ class Qwen3ForCausalLM(nn.Module):
             
             if temperature > 0.0:
                 next_token_logits = next_token_logits / temperature
-            
-            if top_k > 0:
-                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
-                next_token_logits[indices_to_remove] = float('-inf')
-            
-            probs = torch.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+                
+                if top_k > 0:
+                    indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                    next_token_logits[indices_to_remove] = float('-inf')
+                
+                probs = torch.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                # Greedy decoding for T=0
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
             
             input_ids = torch.cat([input_ids, next_token], dim=-1)
+            
+            # Update attention mask and position ids for the new token
+            attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), device=device)], dim=-1)
+            next_pos = position_ids[:, -1:] + 1
+            position_ids = torch.cat([position_ids, next_pos], dim=-1)
         
         return input_ids
 

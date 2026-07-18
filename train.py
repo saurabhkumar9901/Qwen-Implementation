@@ -54,13 +54,12 @@ def train_step(model, batch, optimizer, scheduler, scaler, device, accumulation_
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         
-        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='sum')
+        loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
         loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_logits.float().view(-1, shift_logits.size(-1)),
             shift_labels.view(-1)
         )
-        valid_tokens = max((shift_labels != -100).sum().item(), 1)
-        loss = loss / (valid_tokens * accumulation_steps)
+        loss = loss / accumulation_steps
     
     if scaler is not None and scaler.is_enabled():
         scaler.scale(loss).backward()
@@ -89,18 +88,22 @@ def train_step(model, batch, optimizer, scheduler, scaler, device, accumulation_
 
 def create_optimizer(model, config, device):
     """Create optimizer — 8-bit AdamW on CUDA if available, regular AdamW otherwise."""
+    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and not any(nd in n for nd in ["bias", "norm"])]
+    nodecay_params = [p for n, p in model.named_parameters() if p.requires_grad and any(nd in n for nd in ["bias", "norm"])]
+    optimizer_grouped_parameters = [
+        {'params': decay_params, 'weight_decay': config.weight_decay},
+        {'params': nodecay_params, 'weight_decay': 0.0}
+    ]
     if HAS_BNB and device.type == "cuda":
-        return bnb.optim.AdamW8bit(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        return bnb.optim.AdamW8bit(optimizer_grouped_parameters, lr=config.lr)
     else:
-        return torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        return torch.optim.AdamW(optimizer_grouped_parameters, lr=config.lr)
 
 
 def create_scaler(device, use_amp):
-    """Create GradScaler only for CUDA AMP. Returns None on CPU."""
-    if use_amp and device.type == "cuda":
-        return torch.amp.GradScaler("cuda", enabled=True)
-    else:
-        return None  # No scaler on CPU — avoids crash on older PyTorch
+    """Create GradScaler only for CUDA AMP with float16. bfloat16 does not need scaling."""
+    # Note: this project uses bfloat16, so scaler is not needed.
+    return None
 
 
 def resume_from_checkpoint(args, model, optimizer, scheduler):
@@ -184,6 +187,7 @@ def train_code(args):
     if start_epoch > 0 or start_step > 0:
         print(f"  Resuming from epoch {start_epoch}, step {start_step}")
     
+    running_loss = 0.0
     for epoch in range(start_epoch, num_epochs):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
         
@@ -220,11 +224,14 @@ def train_code(args):
                 step_idx=step_idx,
                 use_amp=use_amp
             )
+            running_loss += loss
             
             if (step_idx + 1) % accumulation_steps == 0:
                 step_num = step_idx + 1
                 lr = scheduler.get_last_lr()[0]
-                print(f"Step {step_num}/{len(dataloader)} | Loss: {loss:.4f} | LR: {lr:.2e}")
+                avg_loss = running_loss / accumulation_steps
+                print(f"Step {step_num}/{len(dataloader)} | Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+                running_loss = 0.0
                 
                 if checkpoint_manager and step_num % (accumulation_steps * 10) == 0:
                     checkpoint_manager.save_checkpoint(
@@ -233,7 +240,7 @@ def train_code(args):
                         scheduler=scheduler,
                         epoch=epoch,
                         step=step_idx,
-                        loss=loss,
+                        loss=avg_loss,
                         filename=f"code_checkpoint_epoch{epoch}_step{step_idx}.pt"
                     )
         
@@ -310,6 +317,7 @@ def train_code_instruction(args):
     
     print(f"\nStarting instruction tuning...")
     
+    running_loss = 0.0
     for epoch in range(start_epoch, num_epochs):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
         
@@ -346,11 +354,14 @@ def train_code_instruction(args):
                 step_idx=step_idx,
                 use_amp=use_amp
             )
+            running_loss += loss
             
             if (step_idx + 1) % accumulation_steps == 0:
                 step_num = step_idx + 1
                 lr = scheduler.get_last_lr()[0]
-                print(f"Step {step_num}/{len(dataloader)} | Loss: {loss:.4f} | LR: {lr:.2e}")
+                avg_loss = running_loss / accumulation_steps
+                print(f"Step {step_num}/{len(dataloader)} | Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+                running_loss = 0.0
                 
                 if checkpoint_manager and step_num % (accumulation_steps * 10) == 0:
                     checkpoint_manager.save_checkpoint(
@@ -359,7 +370,7 @@ def train_code_instruction(args):
                         scheduler=scheduler,
                         epoch=epoch,
                         step=step_idx,
-                        loss=loss,
+                        loss=avg_loss,
                         filename=f"instruction_checkpoint_epoch{epoch}_step{step_idx}.pt"
                     )
 

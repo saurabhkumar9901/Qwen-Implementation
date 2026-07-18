@@ -98,21 +98,22 @@ class CodeDataset(BaseDataset, IterableDataset):
         return texts
 
     def _process_single_text(self, text):
-        """Process a single text string into multiple chunks, ensuring EOS token on every chunk."""
+        """Process a single text string into chunks."""
         chunks = []
         encoding = self.tokenizer(text, return_tensors='pt', add_special_tokens=False)
         input_ids_full = encoding['input_ids'].squeeze(0)
         
         eos_id = self.tokenizer.eos_token_id
         
-        seq_len = input_ids_full.size(0)
-        for i in range(0, seq_len, self.max_length - 1): # leave room for eos
-            chunk = input_ids_full[i : i + self.max_length - 1]
+        # Ensure the document ends with EOS before chunking
+        if input_ids_full[-1].item() != eos_id:
+            input_ids_full = torch.cat([input_ids_full, torch.tensor([eos_id], dtype=torch.long)])
             
-            # Ensure every chunk gets an EOS token
-            if chunk[-1].item() != eos_id:
-                chunk = torch.cat([chunk, torch.tensor([eos_id], dtype=torch.long)])
-                
+        seq_len = input_ids_full.size(0)
+        # Chunk exactly by max_length
+        for i in range(0, seq_len, self.max_length):
+            chunk = input_ids_full[i : i + self.max_length]
+            
             pad_len = self.max_length - chunk.size(0)
             
             if pad_len > 0:
@@ -164,8 +165,10 @@ class CodeDataset(BaseDataset, IterableDataset):
                     text = sample.get('content', '')
                     chunks = self._process_single_text(text)
                     for chunk in chunks:
+                        if count >= self.num_samples:
+                            break
                         yield chunk
-                    count += 1
+                        count += 1
                 return
             except Exception as e:
                 print(f"[WARNING] Streaming failed: {e}. Falling back to synthetic.")
@@ -174,10 +177,14 @@ class CodeDataset(BaseDataset, IterableDataset):
         while count < self.num_samples:
             texts = self._generate_synthetic_code()
             for text in texts:
+                if count >= self.num_samples:
+                    break
                 chunks = self._process_single_text(text)
                 for chunk in chunks:
+                    if count >= self.num_samples:
+                        break
                     yield chunk
-            count += len(texts)
+                    count += 1
 
 
 class CodeInstructionDataset(BaseDataset, Dataset):
@@ -274,24 +281,27 @@ class CodeInstructionDataset(BaseDataset, Dataset):
         else:
             prompt = f"### Instruction:\n{instruction}\n\n### Response:\n"
         
-        full_text = prompt + output + self.tokenizer.eos_token
+        prompt_ids = self.tokenizer(prompt, return_tensors='pt', add_special_tokens=False)['input_ids'].squeeze(0)
+        output_ids = self.tokenizer(output, return_tensors='pt', add_special_tokens=False)['input_ids'].squeeze(0)
+        eos_id = self.tokenizer.eos_token_id
         
-        encoding = self.tokenizer(
-            full_text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
+        # Combine and truncate to max_length - 1 to leave room for EOS
+        input_ids = torch.cat([prompt_ids, output_ids])
+        if input_ids.size(0) >= self.max_length:
+            input_ids = input_ids[:self.max_length - 1]
+            
+        input_ids = torch.cat([input_ids, torch.tensor([eos_id], dtype=torch.long)])
         
-        # Mask prompt tokens from the loss
-        prompt_encoding = self.tokenizer(prompt, return_tensors='pt')
-        prompt_len = prompt_encoding['input_ids'].shape[1]
-        
-        input_ids = encoding['input_ids'].squeeze(0)
-        attention_mask = encoding['attention_mask'].squeeze(0)
+        pad_len = self.max_length - input_ids.size(0)
+        if pad_len > 0:
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else eos_id
+            input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_id, dtype=torch.long)])
+            attention_mask = torch.cat([torch.ones(self.max_length - pad_len, dtype=torch.long), torch.zeros(pad_len, dtype=torch.long)])
+        else:
+            attention_mask = torch.ones(self.max_length, dtype=torch.long)
+            
         labels = input_ids.clone()
-        mask_len = min(prompt_len, self.max_length)
+        mask_len = min(prompt_ids.size(0), self.max_length)
         labels[:mask_len] = -100  # Don't compute loss on prompt
         labels = self._mask_padding_in_labels(labels, attention_mask)
         

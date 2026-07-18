@@ -29,8 +29,20 @@ class Qwen3RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cache", emb.cos(), persistent=False)
         self.register_buffer("sin_cache", emb.sin(), persistent=False)
 
+    def _update_cache(self, max_seq_len):
+        self.max_position_embeddings = max_seq_len
+        t = torch.arange(max_seq_len, device=self.inv_freq.device).float()
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cache", emb.cos(), persistent=False)
+        self.register_buffer("sin_cache", emb.sin(), persistent=False)
+
     def forward(self, position_ids):
         # position_ids: (batch, seq_len)
+        max_seq_len = position_ids.max().item() + 1
+        if max_seq_len > self.max_position_embeddings:
+            self._update_cache(max_seq_len)
+            
         cos = self.cos_cache[position_ids]
         sin = self.sin_cache[position_ids]
         return cos, sin
