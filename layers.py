@@ -14,7 +14,7 @@ class Qwen3RMSNorm(nn.Module):
         return self.weight * hidden_states
 
 class Qwen3RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=1000000.0):
+    def __init__(self, dim, max_position_embeddings=8192, base=1000000.0):
         super().__init__()
         self.dim = dim
         self.base = base

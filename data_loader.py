@@ -48,7 +48,7 @@ class CodeDataset(BaseDataset, IterableDataset):
         self.split = split
         self.language = language
         self.streaming = streaming
-        self.num_samples = num_samples or 100
+        self.num_samples = num_samples
         self._cached_data = []
         
         if not self.streaming:
@@ -70,7 +70,8 @@ class CodeDataset(BaseDataset, IterableDataset):
         print(f"[INFO] Loading {dataset_name} (language={language})...")
         texts = []
         ds = load_dataset(dataset_name, data_dir=language, split=split)
-        for i in range(min(self.num_samples, len(ds))):
+        limit = self.num_samples if self.num_samples is not None else len(ds)
+        for i in range(min(limit, len(ds))):
             texts.append(ds[i].get('content', ''))
         
         if not texts:
@@ -132,10 +133,68 @@ class CodeDataset(BaseDataset, IterableDataset):
             })
         return chunks
 
+    def _pack_text(self, text):
+        """
+        Dynamic packing for code files.
+        Keeps complete files when they fit and packs multiple short files
+        into one training sequence to reduce padding waste.
+        """
+        tokens = self.tokenizer(
+            text,
+            add_special_tokens=False,
+            truncation=False
+        )["input_ids"]
+
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is not None:
+            tokens = tokens + [eos_id]
+
+        # Split very large files, but preserve complete smaller files
+        sequences = []
+        current = []
+
+        for token in tokens:
+            if len(current) + 1 > self.max_length:
+                if current:
+                    sequences.append(current)
+                current = []
+            current.append(token)
+
+        if current:
+            sequences.append(current)
+
+        packed = []
+        for seq in sequences:
+            tensor = torch.tensor(seq, dtype=torch.long)
+
+            pad_len = self.max_length - tensor.size(0)
+            if pad_len > 0:
+                pad_id = self.tokenizer.pad_token_id
+                tensor = torch.cat([
+                    tensor,
+                    torch.full((pad_len,), pad_id, dtype=torch.long)
+                ])
+                attention_mask = torch.cat([
+                    torch.ones(len(seq), dtype=torch.long),
+                    torch.zeros(pad_len, dtype=torch.long)
+                ])
+            else:
+                attention_mask = torch.ones(self.max_length, dtype=torch.long)
+
+            labels = self._mask_padding_in_labels(tensor, attention_mask)
+
+            packed.append({
+                "input_ids": tensor,
+                "attention_mask": attention_mask,
+                "labels": labels
+            })
+
+        return packed
+
     def _process_chunks(self, texts):
         self._cached_data = []
         for text in texts:
-            self._cached_data.extend(self._process_single_text(text))
+            self._cached_data.extend(self._pack_text(text))
         print(f"[INFO] Processed texts into {len(self._cached_data)} chunks of length {self.max_length}")
     
     def __len__(self):
@@ -163,7 +222,7 @@ class CodeDataset(BaseDataset, IterableDataset):
                     if count >= self.num_samples:
                         break
                     text = sample.get('content', '')
-                    chunks = self._process_single_text(text)
+                    chunks = self._pack_text(text)
                     for chunk in chunks:
                         if count >= self.num_samples:
                             break
@@ -179,7 +238,7 @@ class CodeDataset(BaseDataset, IterableDataset):
             for text in texts:
                 if count >= self.num_samples:
                     break
-                chunks = self._process_single_text(text)
+                chunks = self._pack_text(text)
                 for chunk in chunks:
                     if count >= self.num_samples:
                         break

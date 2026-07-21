@@ -44,7 +44,7 @@ def run_training(mode: str = "code", auto_resume: bool = True):
     os.chdir("/workspace")
     
     cmd = [
-        "python", "train.py",
+        "python", "-u", "train.py",
         "--mode", mode,
         "--gradient_checkpointing",
         "--save_checkpoints",
@@ -65,3 +65,4 @@ def main(mode: str = "code", resume: bool = True):
     run_training.remote(mode=mode, auto_resume=resume)
     
     print(f"\n✅ Training completed!")
+# hello

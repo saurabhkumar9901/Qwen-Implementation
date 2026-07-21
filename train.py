@@ -154,6 +154,8 @@ def train_code(args):
         num_samples=config.num_samples,
         streaming=args.streaming
     )
+    print(f"Dataset size: {len(dataset)}")
+    print(f"Sequence length: {config.max_position_embeddings}")
     
     accumulation_steps = config.accumulation_steps
     num_epochs = config.epochs
@@ -189,7 +191,7 @@ def train_code(args):
     
     running_loss = 0.0
     for epoch in range(start_epoch, num_epochs):
-        print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
+        print(f"\n--- Epoch {epoch+1}/{num_epochs} ---", flush=True)
         
         # Deterministic shuffle per epoch for safe resuming
         if getattr(dataset, "streaming", False) or isinstance(dataset, torch.utils.data.IterableDataset):
@@ -230,7 +232,7 @@ def train_code(args):
                 step_num = step_idx + 1
                 lr = scheduler.get_last_lr()[0]
                 avg_loss = running_loss / accumulation_steps
-                print(f"Step {step_num}/{len(dataloader)} | Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+                print(f"Step {step_num}/{len(dataloader)} | Loss: {avg_loss:.4f} | LR: {lr:.2e}", flush=True)
                 running_loss = 0.0
                 
                 if checkpoint_manager and step_num % (accumulation_steps * 10) == 0:
@@ -319,7 +321,7 @@ def train_code_instruction(args):
     
     running_loss = 0.0
     for epoch in range(start_epoch, num_epochs):
-        print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
+        print(f"\n--- Epoch {epoch+1}/{num_epochs} ---", flush=True)
         
         # Deterministic shuffle per epoch for safe resuming
         if getattr(dataset, "streaming", False) or isinstance(dataset, torch.utils.data.IterableDataset):
@@ -360,7 +362,7 @@ def train_code_instruction(args):
                 step_num = step_idx + 1
                 lr = scheduler.get_last_lr()[0]
                 avg_loss = running_loss / accumulation_steps
-                print(f"Step {step_num}/{len(dataloader)} | Loss: {avg_loss:.4f} | LR: {lr:.2e}")
+                print(f"Step {step_num}/{len(dataloader)} | Loss: {avg_loss:.4f} | LR: {lr:.2e}", flush=True)
                 running_loss = 0.0
                 
                 if checkpoint_manager and step_num % (accumulation_steps * 10) == 0:
@@ -398,7 +400,7 @@ def main():
     
     parser.add_argument('--mode', type=str, default='code', choices=['code', 'instruction'],
                         help='Training mode')
-    parser.add_argument('--max_length', type=int, default=2048, help='Maximum sequence length')
+    parser.add_argument('--max_length', type=int, default=4096, help='Maximum sequence length')
     parser.add_argument('--language', type=str, default='python', help='Programming language for code dataset')
     parser.add_argument('--gradient_checkpointing', action='store_true', help='Enable gradient checkpointing')
     parser.add_argument('--save_checkpoints', action='store_true', help='Save checkpoints during training')
